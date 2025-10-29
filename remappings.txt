@@ -1,0 +1,2 @@
+@openzeppelin/=lib/openzeppelin-contracts/
+@NFT_collection_ERC-721/=lib/NFT_collection_ERC-721
