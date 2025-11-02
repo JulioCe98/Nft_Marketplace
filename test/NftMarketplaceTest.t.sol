@@ -9,6 +9,8 @@ import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
+import {IERC721Receiver} from "@openzeppelin/contracts/interfaces/IERC721Receiver.sol";
+
 contract MockUsdt is ERC20 {
     constructor(
         string memory name_,
@@ -20,21 +22,41 @@ contract MockUsdt is ERC20 {
     }
 }
 
+contract MockUserCantReceive is IERC721Receiver {
+    receive() external payable {
+        revert("Failed");
+    }
+
+    function onERC721Received(
+        address,
+        address,
+        uint256,
+        bytes calldata
+    ) external pure override returns (bytes4) {
+        return IERC721Receiver.onERC721Received.selector;
+    }
+}
+
 contract NftMarketplaceTest is Test {
     NftMarketplace nftMarketplace;
     NFTCollection nftCollection;
     MockUsdt usdtMock;
+    MockUserCantReceive mockUserCantReceive;
 
     string name = "NFT Collection Test";
     string symbol = "NFTCT";
     uint nftCollectionMaxSupply = 2;
     string baseURI = "ipfs://xyz/";
 
-    address user = vm.addr(1);
-    address secondaryUser = vm.addr(2);
+    address marketplaceOwner = vm.addr(1);
+    address user = vm.addr(2);
+    address secondaryUser = vm.addr(3);
 
     function setUp() public {
+        vm.startPrank(marketplaceOwner);
         nftMarketplace = new NftMarketplace();
+        vm.stopPrank();
+
         nftCollection = new NFTCollection(
             name,
             symbol,
@@ -42,6 +64,8 @@ contract NftMarketplaceTest is Test {
             baseURI
         );
         usdtMock = new MockUsdt("USD", "USDT");
+
+        mockUserCantReceive = new MockUserCantReceive();
     }
 
     function testSellNftV2WithEther() public {
@@ -467,6 +491,8 @@ contract NftMarketplaceTest is Test {
     }
 
     function testChangeMarketplaceFee() public {
+        vm.startPrank(marketplaceOwner);
+
         uint initialFee = nftMarketplace.marketplaceFeePercent();
 
         uint newFee = 10;
@@ -475,6 +501,8 @@ contract NftMarketplaceTest is Test {
         uint currentFee = nftMarketplace.marketplaceFeePercent();
         assert(currentFee == newFee);
         assert(currentFee != initialFee);
+
+        vm.stopPrank();
     }
 
     function testCantChangeMarketplaceFee() public {
@@ -1214,6 +1242,316 @@ contract NftMarketplaceTest is Test {
         );
 
         assert(nft.seller == user);
+        assert(nft.nftCollectionAddress == address(nftCollection));
+        assert(nft.tokenId == tokenIdToMint);
+        assert(nft.paymentTokenAddress == address(0));
+        assert(nft.price == nftPrice);
+    }
+
+    function testReceiveEther() public {
+        uint etherToDeal = 5 ether;
+        vm.deal(address(this), etherToDeal);
+
+        uint etherToSend = 2 ether;
+        (bool transactionResult, ) = address(nftMarketplace).call{
+            value: etherToSend
+        }("");
+        require(transactionResult, "Transaction failed");
+
+        assert(address(this).balance == etherToDeal - etherToSend);
+        assert(address(nftMarketplace).balance == etherToSend);
+    }
+
+    function testWithdrawErc20() public {
+        vm.startPrank(user);
+
+        uint userErc20BalanceBeforeMint = IERC20(address(usdtMock)).balanceOf(
+            user
+        );
+        assert(userErc20BalanceBeforeMint == 0);
+
+        //User mints 2000 usdt mock
+        uint toMint = 2000;
+        usdtMock.mint(toMint);
+
+        //Check the user ERC20 new balance
+        uint userErc20BalanceAfterMint = IERC20(address(usdtMock)).balanceOf(
+            user
+        );
+        assert(userErc20BalanceAfterMint == toMint);
+
+        //Check market ERC20 balance
+        uint marketErc20BalanceBeforeSend = IERC20(address(usdtMock)).balanceOf(
+            address(nftMarketplace)
+        );
+        assert(marketErc20BalanceBeforeSend == 0);
+
+        //Transfer from user to NFTMarketplace
+        uint toSend = 1000;
+        bool result = IERC20(address(usdtMock)).transfer(
+            address(nftMarketplace),
+            toSend
+        );
+        assert(result);
+
+        //Check new ERC20 market balance
+        uint marketErc20BalanceAfterSend = IERC20(address(usdtMock)).balanceOf(
+            address(nftMarketplace)
+        );
+        assert(marketErc20BalanceAfterSend == toSend);
+
+        uint userNewBalanceAfterTransfer = IERC20(address(usdtMock)).balanceOf(
+            user
+        );
+        assert(userNewBalanceAfterTransfer == toMint - toSend);
+
+        vm.stopPrank();
+
+        //Mock marketplace owner
+        vm.startPrank(marketplaceOwner);
+
+        //Check owner ERC20 balance
+        uint ownerErc20BalanceBeforeWithdraw = IERC20(address(usdtMock))
+            .balanceOf(marketplaceOwner);
+        assert(ownerErc20BalanceBeforeWithdraw == 0);
+
+        //Try to withdraw the ERC20 tokens
+        uint toWithdraw = 800;
+        nftMarketplace.withdrawErc20(address(usdtMock), toWithdraw);
+
+        //Check owner new ERC20 balance
+        uint ownerErc20BalanceAfterWithdraw = IERC20(address(usdtMock))
+            .balanceOf(marketplaceOwner);
+        assert(ownerErc20BalanceAfterWithdraw == toWithdraw);
+
+        //Check the market balance after withdraw
+        uint marketCurrentBalance = IERC20(address(usdtMock)).balanceOf(
+            address(nftMarketplace)
+        );
+
+        assert(marketCurrentBalance == toSend - toWithdraw);
+
+        vm.stopPrank();
+    }
+
+    function testCantWithdrawErc20NotOwner() public {
+        vm.startPrank(user);
+
+        uint userErc20BalanceBeforeMint = IERC20(address(usdtMock)).balanceOf(
+            user
+        );
+        assert(userErc20BalanceBeforeMint == 0);
+
+        //User mints 2000 usdt mock
+        uint toMint = 2000;
+        usdtMock.mint(toMint);
+
+        //Check the user ERC20 new balance
+        uint userErc20BalanceAfterMint = IERC20(address(usdtMock)).balanceOf(
+            user
+        );
+        assert(userErc20BalanceAfterMint == toMint);
+
+        //Check market ERC20 balance
+        uint marketErc20BalanceBeforeSend = IERC20(address(usdtMock)).balanceOf(
+            address(nftMarketplace)
+        );
+        assert(marketErc20BalanceBeforeSend == 0);
+
+        //Transfer from user to NFTMarketplace
+        uint toSend = 1000;
+        bool result = IERC20(address(usdtMock)).transfer(
+            address(nftMarketplace),
+            toSend
+        );
+        assert(result);
+
+        //Check new ERC20 market balance
+        uint marketErc20BalanceAfterSend = IERC20(address(usdtMock)).balanceOf(
+            address(nftMarketplace)
+        );
+        assert(marketErc20BalanceAfterSend == toSend);
+
+        uint userNewBalanceAfterTransfer = IERC20(address(usdtMock)).balanceOf(
+            user
+        );
+        assert(userNewBalanceAfterTransfer == toMint - toSend);
+
+        vm.stopPrank();
+
+        //Mock the secondary user
+        vm.startPrank(secondaryUser);
+
+        //Check secondary user ERC20 balance
+        uint secondaryUserErc20BalanceBeforeWithdraw = IERC20(address(usdtMock))
+            .balanceOf(secondaryUser);
+        assert(secondaryUserErc20BalanceBeforeWithdraw == 0);
+
+        //Try to withdraw the ERC20 tokens using other user not the owner
+        uint toWithdraw = 800;
+        vm.expectRevert();
+        nftMarketplace.withdrawErc20(address(usdtMock), toWithdraw);
+
+        vm.stopPrank();
+    }
+
+    function testWithdrawEther() public {
+        vm.startPrank(marketplaceOwner);
+
+        uint etherToDeal = 5 ether;
+        vm.deal(marketplaceOwner, etherToDeal);
+
+        uint etherToSend = 2 ether;
+        (bool transactionResult, ) = address(nftMarketplace).call{
+            value: etherToSend
+        }("");
+        require(transactionResult, "Transaction failed");
+
+        uint ownerEtherBalanceAfterSend = etherToDeal - etherToSend;
+        uint marketNewBalance = address(nftMarketplace).balance;
+        assert(marketplaceOwner.balance == ownerEtherBalanceAfterSend);
+        assert(marketNewBalance == etherToSend);
+
+        uint etherToWithdraw = 1 ether;
+        nftMarketplace.withdrawEther(etherToWithdraw);
+
+        assert(
+            marketplaceOwner.balance ==
+                ownerEtherBalanceAfterSend + etherToWithdraw
+        );
+        assert(
+            address(nftMarketplace).balance ==
+                marketNewBalance - etherToWithdraw
+        );
+
+        vm.stopPrank();
+    }
+
+    function testCantWithdrawEtherNotOwner() public {
+        vm.startPrank(marketplaceOwner);
+
+        uint etherToDeal = 5 ether;
+        vm.deal(marketplaceOwner, etherToDeal);
+
+        uint etherToSend = 2 ether;
+        (bool transactionResult, ) = address(nftMarketplace).call{
+            value: etherToSend
+        }("");
+        require(transactionResult, "Transaction failed");
+
+        uint ownerEtherBalanceAfterSend = etherToDeal - etherToSend;
+        uint marketNewBalance = address(nftMarketplace).balance;
+        assert(marketplaceOwner.balance == ownerEtherBalanceAfterSend);
+        assert(marketNewBalance == etherToSend);
+
+        vm.stopPrank();
+
+        //Mock other user
+        vm.startPrank(user);
+
+        //Try to withdraw ether with not the owner
+        uint etherToWithdraw = 1 ether;
+        vm.expectRevert();
+        nftMarketplace.withdrawEther(etherToWithdraw);
+
+        vm.stopPrank();
+    }
+
+    function testBuyWithEtherSellerCantReceive() public {
+        //Mock the user who cant receive ether
+        vm.startPrank(address(mockUserCantReceive));
+
+        //First ID to mint
+        uint tokenIdToMint = nftCollection.getCurrentTokenId();
+        assert(tokenIdToMint == 0);
+
+        nftCollection.mintNft();
+
+        uint currentTokenId = nftCollection.getCurrentTokenId();
+        assert(currentTokenId == 1);
+
+        //Check owner of minted NFT
+        assert(
+            IERC721(address(nftCollection)).ownerOf(tokenIdToMint) ==
+                address(mockUserCantReceive)
+        );
+
+        //Check initial marketplace listed NFTs
+        uint nftsListed = nftMarketplace.nftsListedV2Length();
+        NftMarketplace.NftV2[] memory myNftListed = nftMarketplace
+            .getMyNftsListedV2();
+
+        assert(nftsListed == 0);
+        assert(myNftListed.length == 0);
+
+        uint nftPrice = 1 ether;
+        nftMarketplace.sellNftV2(
+            address(nftCollection),
+            tokenIdToMint,
+            address(0),
+            nftPrice
+        );
+
+        //Check if the marketplace listed the new NFT
+        nftsListed = nftMarketplace.nftsListedV2Length();
+        myNftListed = nftMarketplace.getMyNftsListedV2();
+
+        assert(nftsListed == 1);
+        assert(myNftListed.length == 1);
+
+        //Check if the NFT data is correct
+        NftMarketplace.NftV2 memory nft = nftMarketplace.getNftV2(
+            address(nftCollection),
+            tokenIdToMint
+        );
+
+        assert(nft.seller == address(mockUserCantReceive));
+        assert(nft.nftCollectionAddress == address(nftCollection));
+        assert(nft.tokenId == tokenIdToMint);
+        assert(nft.paymentTokenAddress == address(0));
+        assert(nft.price == nftPrice);
+
+        //Approve the marketplace to transfer the NFT
+        IERC721(address(nftCollection)).approve(
+            address(nftMarketplace),
+            tokenIdToMint
+        );
+
+        vm.stopPrank();
+
+        //Mock to the user who will buy the NFT
+        vm.startPrank(secondaryUser);
+        //Deal some ether to the buyer
+        uint etherToDeal = 2 ether;
+        vm.deal(secondaryUser, etherToDeal);
+
+        //Check if the ether was correctly sent to the contract
+        uint secondaryUserInitialBalance = secondaryUser.balance;
+        assert(secondaryUserInitialBalance == etherToDeal);
+
+        //Buy the NFT with the other user
+        vm.expectRevert("Transfer failed");
+        nftMarketplace.buyNftV2{value: nftPrice}(
+            address(nftCollection),
+            tokenIdToMint
+        );
+
+        vm.stopPrank();
+
+        //Check the revert effects
+        vm.startPrank(address(mockUserCantReceive));
+
+        myNftListed = nftMarketplace.getMyNftsListedV2();
+        assert(myNftListed.length == 1);
+
+        vm.stopPrank();
+
+        nftsListed = nftMarketplace.nftsListedV2Length();
+        assert(nftsListed == 1);
+
+        nft = nftMarketplace.getNftV2(address(nftCollection), tokenIdToMint);
+
+        assert(nft.seller == address(mockUserCantReceive));
         assert(nft.nftCollectionAddress == address(nftCollection));
         assert(nft.tokenId == tokenIdToMint);
         assert(nft.paymentTokenAddress == address(0));

@@ -29,6 +29,11 @@ contract NftMarketplace is Ownable {
         _;
     }
 
+    modifier validateAmount(uint amount_) {
+        _isValidAmount(amount_);
+        _;
+    }
+
     event onNftV2Listed(
         address indexed nftCollectionAddress_,
         uint indexed tokenId_,
@@ -232,6 +237,23 @@ contract NftMarketplace is Ownable {
         marketplaceFeePercent = newFee;
     }
 
+    receive() external payable {}
+
+    function withdrawEther(
+        uint amount_
+    ) external onlyOwner validateAmount(amount_) {
+        (bool transactionResult, ) = msg.sender.call{value: amount_}("");
+        require(transactionResult, "Withdraw failed");
+    }
+
+    function withdrawErc20(
+        address tokenAddress_,
+        uint amount_
+    ) external onlyOwner validateAmount(amount_) {
+        bool result = IERC20(tokenAddress_).transfer(msg.sender, amount_);
+        require(result, "Withdraw failed");
+    }
+
     function _removeNftV2(
         address nftCollectionAddress_,
         uint tokenId_,
@@ -259,5 +281,9 @@ contract NftMarketplace is Ownable {
             nftsListedV2[nftCollectionAddress_][tokenId_].seller != address(0),
             "NFT doesn't exist"
         );
+    }
+
+    function _isValidAmount(uint amount_) internal pure {
+        require(amount_ > 0, "Invalid amount");
     }
 }
